@@ -1116,10 +1116,6 @@ with st.sidebar:
 st.markdown('<div class="scp-section-label">🎯 Operating Scope &middot; Program Filter</div>', unsafe_allow_html=True)
 project_filter = st.radio("Project", ["All"] + all_projects, horizontal=True, label_visibility="collapsed")
 
-# Background Copilot Launcher. Keep it outside the dashboard flow while passing
-# the active program scope into grounded retrieval.
-copilot.render_copilot(DB_PATH, {"project": project_filter})
-
 def scope(df, col="project"):
     if project_filter == "All" or col not in df.columns:
         return df
