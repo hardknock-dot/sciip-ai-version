@@ -8,3 +8,6 @@ data/copilot_config.json
 !.env.example
 
 data/copilot_config.json
+# Local data and chat history
+data/copilot_conversations.json
+data/sciip.db
