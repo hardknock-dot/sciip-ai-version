@@ -1048,9 +1048,6 @@ st.markdown(f"""
 
 refresh_panel.show_pending_notifications()
 
-# Background Copilot Launcher
-copilot.render_copilot(DB_PATH)
-
 if len(part_intel) == 0:
     st.info("No data loaded yet - upload your latest Sales Register below to get started.")
     refresh_panel.render_refresh_panel(key_prefix="first_run")
@@ -1118,6 +1115,10 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 st.markdown('<div class="scp-section-label">🎯 Operating Scope &middot; Program Filter</div>', unsafe_allow_html=True)
 project_filter = st.radio("Project", ["All"] + all_projects, horizontal=True, label_visibility="collapsed")
+
+# Background Copilot Launcher. Keep it outside the dashboard flow while passing
+# the active program scope into grounded retrieval.
+copilot.render_copilot(DB_PATH, {"project": project_filter})
 
 def scope(df, col="project"):
     if project_filter == "All" or col not in df.columns:
@@ -1772,7 +1773,7 @@ with tab_item:
 # TAB 8: AI COPILOT INTELLIGENCE MODULE
 # ===========================================================================
 with tab_copilot:
-    copilot.render_copilot_tab(DB_PATH)
+    copilot.render_copilot_tab(DB_PATH, {"project": project_filter})
 
 # ===========================================================================
 # TAB 9: DATA REFRESH & INGESTION

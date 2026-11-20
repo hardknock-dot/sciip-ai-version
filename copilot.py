@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from copilot_analytics import retrieve_analytics
 import streamlit as st
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -67,8 +69,8 @@ PROVIDER_PRESETS = {
     "Google Gemini": {
         "id": "gemini",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "models": ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash", "gemini-3.8-flash"],
-        "default_model": "gemini-2.5-flash",
+        "models": ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
+        "default_model": "gemini-3.8-flash",
         "env_var": "SCIIP_AI_API_KEY_1",
     },
     "OpenAI": {
@@ -131,8 +133,88 @@ class ProviderConfig:
     base_url: str | None = None
 
 
+@dataclass(frozen=True)
+class ProviderHealth:
+    provider: str
+    model: str
+    ok: bool
+    category: str
+    detail: str
+    latency_ms: int | None = None
+
+
 def _env(name: str) -> str:
     return os.getenv(name, "").strip()
+
+
+def _provider_id(name: str) -> str:
+    value = (name or "").strip().lower()
+    for display_name, preset in PROVIDER_PRESETS.items():
+        if value in {display_name.lower(), preset["id"].lower()}:
+            return preset["id"]
+    return value
+
+
+def _provider_display_name(provider_id: str) -> str:
+    provider_id = _provider_id(provider_id)
+    for display_name, preset in PROVIDER_PRESETS.items():
+        if preset["id"] == provider_id:
+            return display_name
+    return provider_id or "Google Gemini"
+
+
+def _provider_defaults(provider_id: str) -> tuple[str, str]:
+    preset = PROVIDER_PRESETS.get(_provider_display_name(provider_id), PROVIDER_PRESETS["Google Gemini"])
+    return preset["base_url"], preset["default_model"]
+
+
+def _normalise_provider(name: str, api_key: str, model: str, base_url: str | None) -> ProviderConfig:
+    provider_id = _provider_id(name or "gemini")
+    display_name = _provider_display_name(provider_id)
+    default_url, default_model = _provider_defaults(provider_id)
+    return ProviderConfig(
+        name=display_name,
+        api_key=(api_key or "").strip(),
+        model=(model or default_model).strip(),
+        base_url=(base_url or default_url or None),
+    )
+
+
+def _saved_base_url(provider_name: str, base_url: str | None) -> str | None:
+    """Repair a saved config when it contains another preset's default URL."""
+    if not base_url:
+        return None
+    known_urls = {
+        preset["base_url"]
+        for preset in PROVIDER_PRESETS.values()
+        if preset.get("base_url")
+    }
+    provider = PROVIDER_PRESETS.get(_provider_display_name(provider_name))
+    if provider and base_url in known_urls:
+        return provider.get("base_url") or None
+    return base_url
+
+
+def classify_provider_error(exc: Exception) -> tuple[str, bool, str]:
+    """Classify provider failures without returning credentials or raw payloads."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    name = type(exc).__name__.lower()
+    if status == 401 or "authentication" in name:
+        return "authentication", False, "API key rejected"
+    if status == 403 or "permission" in name:
+        return "permission", False, "Provider access denied"
+    if status == 404 or "notfound" in name:
+        return "model_unavailable", False, "Model or endpoint unavailable"
+    if status == 429 or "rate" in name or "quota" in str(exc).lower():
+        return "rate_limit", True, "Rate limit or quota exceeded"
+    if status in {500, 502, 503, 504} or "server" in name:
+        return "provider_unavailable", True, "Provider temporarily unavailable"
+    if "timeout" in name or "timed out" in str(exc).lower():
+        return "timeout", True, "Provider request timed out"
+    return "provider_error", False, "Provider request failed"
 
 
 # ---------------------------------------------------------------------------
@@ -143,33 +225,52 @@ def _get_config_path(db_path: str | Path) -> Path:
 
 
 def load_active_provider_config(db_path: str | Path) -> ProviderConfig:
-    """Load active provider config from copilot_config.json or fall back to .env."""
+    """Load the provider explicitly selected in the UI, then use env defaults."""
     cfg_file = _get_config_path(db_path)
     if cfg_file.exists():
         try:
             data = json.loads(cfg_file.read_text(encoding="utf-8"))
-            if data and isinstance(data, dict):
-                return ProviderConfig(
-                    name=data.get("name", "Google Gemini"),
-                    api_key=data.get("api_key", ""),
-                    model=data.get("model", "gemini-2.5-flash"),
-                    base_url=data.get("base_url") or None,
+            if data and isinstance(data, dict) and (data.get("name") or data.get("api_key")):
+                saved = _normalise_provider(
+                    data.get("name", "Google Gemini"),
+                    data.get("api_key", ""),
+                    data.get("model", ""),
+                    _saved_base_url(data.get("name", "Google Gemini"), data.get("base_url") or None),
                 )
+                # If this provider is defined in .env, its slot is the source
+                # of truth for that provider's credential/model/endpoint. The
+                # saved JSON still supplies the user's selected provider.
+                env_config = _configured_provider_from_env(saved.name)
+                if env_config:
+                    return env_config
+                return saved
         except Exception as e:
             logger.warning("Error reading copilot_config.json: %s", e)
 
-    # Fallback to .env defaults
-    env_name = _env("SCIIP_AI_PROVIDER_1") or "gemini"
-    display_name = "Google Gemini"
-    for k, v in PROVIDER_PRESETS.items():
-        if v["id"] == env_name.lower():
-            display_name = k
-            break
-    preset = PROVIDER_PRESETS.get(display_name, PROVIDER_PRESETS["Google Gemini"])
-    key = _env("SCIIP_AI_API_KEY_1") or _env("OPENAI_API_KEY") or ""
-    model = _env("SCIIP_AI_MODEL_1") or preset["default_model"]
-    base_url = _env("SCIIP_AI_BASE_URL_1") or preset["base_url"] or None
-    return ProviderConfig(name=display_name, api_key=key, model=model, base_url=base_url)
+    env_name = _env("SCIIP_AI_PROVIDER_1")
+    env_key = _env("SCIIP_AI_API_KEY_1") or _env("OPENAI_API_KEY")
+    env_model = _env("SCIIP_AI_MODEL_1")
+    env_url = _env("SCIIP_AI_BASE_URL_1")
+    return _normalise_provider(env_name or "gemini", env_key, env_model, env_url)
+
+
+def _configured_key_for_provider(provider_name: str) -> str:
+    """Resolve a provider's key from its fallback slot or conventional env name."""
+    provider_id = _provider_id(provider_name)
+    for config in configured_fallback_providers():
+        if _provider_id(config.name) == provider_id and config.api_key:
+            return config.api_key
+    preset = PROVIDER_PRESETS.get(_provider_display_name(provider_id), {})
+    return _env(preset.get("env_var", "")) if preset.get("env_var") else ""
+
+
+def _configured_provider_from_env(provider_name: str) -> ProviderConfig | None:
+    """Return the matching environment slot for a provider, if configured."""
+    provider_id = _provider_id(provider_name)
+    for config in configured_fallback_providers():
+        if _provider_id(config.name) == provider_id:
+            return config
+    return None
 
 
 def save_active_provider_config(db_path: str | Path, config: ProviderConfig) -> bool:
@@ -187,29 +288,62 @@ def save_active_provider_config(db_path: str | Path, config: ProviderConfig) -> 
 def configured_fallback_providers() -> list[ProviderConfig]:
     """Return fallback providers from environment variables."""
     providers: list[ProviderConfig] = []
-    defaults = {
-        "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-2.5-flash"),
-        "openai": ("https://api.openai.com/v1", "gpt-4o-mini"),
-        "groq": ("https://api.groq.com/openai/v1", "llama-3.1-8b-instant"),
-        "openrouter": ("https://openrouter.ai/api/v1", "openai/gpt-4o-mini"),
-        "mistral": ("https://api.mistral.ai/v1", "mistral-small-latest"),
-        "together": ("https://api.together.xyz/v1", "meta-llama/Llama-3.3-70B-Instruct-Turbo"),
-    }
     for i in range(1, 5):
         name = _env(f"SCIIP_AI_PROVIDER_{i}")
         key = _env(f"SCIIP_AI_API_KEY_{i}")
         if not name and i == 1 and _env("OPENAI_API_KEY"):
             name, key = "openai", _env("OPENAI_API_KEY")
-        if not name or not key:
+        if not name or (not key and _provider_id(name) != "ollama"):
             continue
-        default_url, default_model = defaults.get(name.lower(), ("", "gpt-4o-mini"))
-        providers.append(ProviderConfig(
-            name=name,
-            api_key=key,
-            model=_env(f"SCIIP_AI_MODEL_{i}") or default_model,
-            base_url=_env(f"SCIIP_AI_BASE_URL_{i}") or default_url or None,
+        providers.append(_normalise_provider(
+            name,
+            key,
+            _env(f"SCIIP_AI_MODEL_{i}"),
+            _env(f"SCIIP_AI_BASE_URL_{i}") or None,
         ))
     return providers
+
+
+def check_provider_health(config: ProviderConfig, timeout: float = 8.0) -> ProviderHealth:
+    """Make a bounded, minimal provider request for an actual connection status."""
+    provider_id = _provider_id(config.name)
+    if provider_id == "offline":
+        return ProviderHealth(config.name, config.model, True, "offline", "Local database evidence only")
+    if not config.api_key and provider_id != "ollama":
+        return ProviderHealth(config.name, config.model, False, "missing_credentials", "API key is not configured")
+    started = time.perf_counter()
+    try:
+        client = OpenAI(
+            api_key=config.api_key or "ollama",
+            base_url=config.base_url,
+            timeout=timeout,
+            max_retries=0,
+        )
+        response = client.chat.completions.create(
+            model=config.model,
+            messages=[{"role": "user", "content": "Reply with OK only."}],
+            temperature=0,
+            max_tokens=5,
+        )
+        ok = bool(response.choices and response.choices[0].message.content)
+        return ProviderHealth(
+            config.name,
+            config.model,
+            ok,
+            "healthy" if ok else "empty_response",
+            "Connection successful" if ok else "Provider returned no text",
+            int((time.perf_counter() - started) * 1000),
+        )
+    except Exception as exc:
+        category, _retryable, detail = classify_provider_error(exc)
+        return ProviderHealth(
+            config.name,
+            config.model,
+            False,
+            category,
+            detail,
+            int((time.perf_counter() - started) * 1000),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -352,8 +486,43 @@ def _score_row(row: pd.Series, question_tokens: set[str], entity_values: dict[st
     return score
 
 
-def retrieve_context(question: str, db_path: str | Path) -> tuple[str, list[str]]:
+def retrieve_context(
+    question: str,
+    db_path: str | Path,
+    dashboard_context: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[str]]:
     """Retrieve evidence from the live SQLite database."""
+    dashboard_context = dashboard_context or {}
+    recent_history = "\n".join(
+        str(item.get("content", ""))[:500]
+        for item in (history or [])[-4:]
+        if item.get("role") in {"user", "assistant"}
+    )
+    retrieval_question = f"{recent_history}\n{question}" if recent_history else question
+    entity_conn = sqlite3.connect(db_path)
+    try:
+        entities = _entities(retrieval_question, entity_conn)
+    finally:
+        entity_conn.close()
+    scope_project = dashboard_context.get("project")
+    if (not scope_project or str(scope_project).lower() == "all") and len(entities.get("project", set())) == 1:
+        scope_project = next(iter(entities["project"]))
+    analytics_evidence, analytics_sources, _intents = retrieve_analytics(
+        retrieval_question,
+        db_path,
+        project=scope_project,
+        entities=entities,
+        limit=MAX_ROWS_PER_TABLE,
+    )
+    if analytics_evidence:
+        chunks = [
+            f"TABLE {table}\n{json.dumps(rows, default=str)}"
+            for table, rows in analytics_evidence.items()
+        ]
+        return "\n\n".join(chunks)[:MAX_CONTEXT_CHARS], analytics_sources
+
+    # Compatibility fallback for questions that do not map to a known intent.
     conn = sqlite3.connect(db_path)
     try:
         q_tokens = _tokens(question)
@@ -411,10 +580,11 @@ def answer_question(
     question: str,
     db_path: str | Path,
     history: list[dict[str, Any]] | None = None,
-    provider_override: ProviderConfig | None = None
+    provider_override: ProviderConfig | None = None,
+    dashboard_context: dict[str, Any] | None = None,
 ) -> tuple[str, list[str], str | None]:
     """Synthesize grounded answer using the selected provider or fallback order."""
-    context, sources = retrieve_context(question, db_path)
+    context, sources = retrieve_context(question, db_path, dashboard_context, history)
 
     # Check if user explicitly set Offline mode
     active = provider_override or load_active_provider_config(db_path)
@@ -427,50 +597,71 @@ def answer_question(
         "Explain inventory positions, demand volatility (Smooth, Erratic, Intermittent, Lumpy), "
         "customer ordering cadence, forecast projections, and replenishment priorities clearly. "
         "Never hallucinate numbers. Cite supporting evidence inline like [table:column/value]. "
-        "If data is missing, note it plainly.\n\n"
+        "If data is missing, note it plainly. Separate observed facts from recommendations. "
+        "For analytical questions, organize the response as: Executive summary, Key findings, "
+        "Metrics, Implications, Recommended actions, and Evidence. Keep it concise and actionable.\n\n"
         f"GROUNDED DATABASE CONTEXT:\n{context}"
     )
 
     messages = [{"role": "system", "content": system}]
-    for item in (history or [])[-8:]:
+    for item in (history or [])[-6:]:
         if item.get("role") in {"user", "assistant"}:
-            messages.append({"role": item["role"], "content": str(item["content"])[:4000]})
+            prior = re.sub(r"```.*?```", "[structured evidence omitted]", str(item["content"]), flags=re.S)
+            messages.append({"role": item["role"], "content": prior[:1800]})
     messages.append({"role": "user", "content": question})
 
-    # Provider attempt queue: Selected provider first, then .env fallbacks
+    # Provider attempt queue: selected provider first, then configured fallbacks.
     providers_queue: list[ProviderConfig] = []
-    if active.api_key:
+    if active.api_key or _provider_id(active.name) == "ollama":
         providers_queue.append(active)
     for p in configured_fallback_providers():
-        if p.name.lower() != active.name.lower():
+        signature = (_provider_id(p.name), p.base_url or "", p.model)
+        existing = {(_provider_id(x.name), x.base_url or "", x.model) for x in providers_queue}
+        if signature not in existing:
             providers_queue.append(p)
 
     if not providers_queue:
         return _local_grounded_answer(question, context, sources), sources, None
 
-    last_error = None
+    failures: list[tuple[str, str]] = []
     for prov in providers_queue:
-        try:
-            client = OpenAI(api_key=prov.api_key, base_url=prov.base_url, timeout=35, max_retries=1)
-            response = client.chat.completions.create(
-                model=prov.model,
-                messages=messages,
-                temperature=0.1,
-                max_tokens=1000
-            )
-            text = response.choices[0].message.content if response.choices else ""
-            if text:
-                logger.info("SCIIP Copilot answered using: %s (%s)", prov.name, prov.model)
-                return text, sources, prov.name
-            last_error = "empty response"
-        except Exception as exc:
-            last_error = str(exc)[:200]
-            logger.warning("Provider %s failed: %s", prov.name, last_error)
-            continue
+        for attempt in range(2):
+            try:
+                client = OpenAI(
+                    api_key=prov.api_key or "ollama",
+                    base_url=prov.base_url,
+                    timeout=25,
+                    max_retries=0,
+                )
+                response = client.chat.completions.create(
+                    model=prov.model,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=1000,
+                )
+                text = response.choices[0].message.content if response.choices else ""
+                if text:
+                    logger.info("SCIIP Copilot answered using: %s (%s)", prov.name, prov.model)
+                    return text, sources, prov.name
+                failures.append((prov.name, "empty_response"))
+                break
+            except Exception as exc:
+                category, retryable, detail = classify_provider_error(exc)
+                failures.append((prov.name, category))
+                logger.warning(
+                    "SCIIP provider failed: provider=%s model=%s category=%s attempt=%d detail=%s",
+                    prov.name, prov.model, category, attempt + 1, detail,
+                )
+                if retryable and attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                break
 
     fallback = _local_grounded_answer(question, context, sources)
+    failure_summary = "; ".join(f"{name}: {category}" for name, category in failures) or "no provider configured"
     return (
-        f"⚠️ **Note: Configured AI provider ({active.name}) encountered an error:** `{last_error}`\n\n"
+        "⚠️ **AI providers were unavailable.**\n\n"
+        f"Attempt summary: `{failure_summary}`\n\n"
         "Here is the grounded SCIIP database evidence directly:\n\n" + fallback,
         sources,
         None
@@ -480,7 +671,7 @@ def answer_question(
 # ---------------------------------------------------------------------------
 # Dedicated Full-Page AI Copilot Module Tab
 # ---------------------------------------------------------------------------
-def render_copilot_tab(db_path: str | Path) -> None:
+def render_copilot_tab(db_path: str | Path, dashboard_context: dict[str, Any] | None = None) -> None:
     """Full-page interactive AI Copilot tab with persistent chat history and provider settings."""
     active_prov = load_active_provider_config(db_path)
     store = load_conversation_store(db_path)
@@ -541,7 +732,7 @@ def render_copilot_tab(db_path: str | Path) -> None:
 
         with p_col3:
             # Preload API key from current config, preset env, or blank
-            preset_env_val = _env(selected_preset["env_var"]) if selected_preset.get("env_var") else ""
+            preset_env_val = _configured_key_for_provider(sel_provider_name)
             default_key = active_prov.api_key if sel_provider_name == active_prov.name else preset_env_val
             sel_key = st.text_input("API Key", value=default_key, type="password", key="copilot_cfg_key",
                                     placeholder="Enter provider API key...",
@@ -566,6 +757,21 @@ def render_copilot_tab(db_path: str | Path) -> None:
                 save_active_provider_config(db_path, new_cfg)
                 st.toast(f"Switched provider to {sel_provider_name} ({sel_model})!", icon="✅")
                 st.rerun()
+            if st.button("Test connection", use_container_width=True, key="copilot_test_provider"):
+                test_cfg = ProviderConfig(
+                    name=sel_provider_name,
+                    api_key=sel_key.strip(),
+                    model=sel_model.strip(),
+                    base_url=sel_url.strip() if sel_url.strip() else None,
+                )
+                health = check_provider_health(test_cfg)
+                st.session_state.copilot_provider_health = asdict(health)
+            health_result = st.session_state.get("copilot_provider_health")
+            if health_result:
+                if health_result.get("ok"):
+                    st.success(f"Connected · {health_result.get('latency_ms')} ms")
+                else:
+                    st.error(f"{health_result.get('category')}: {health_result.get('detail')}")
 
     # -----------------------------------------------------------------------
     # Main Body: Conversation History Sidebar + Active Chat Stream
@@ -700,7 +906,8 @@ def render_copilot_tab(db_path: str | Path) -> None:
                             user_query,
                             db_path,
                             current_session["messages"][:-1],
-                            provider_override=active_prov
+                            provider_override=active_prov,
+                            dashboard_context=dashboard_context,
                         )
                     st.markdown(ans_text)
                     if sources:
@@ -724,7 +931,7 @@ def render_copilot_tab(db_path: str | Path) -> None:
 # Floating Copilot Drawer Dialog (Synchronized with Persistent Store)
 # ---------------------------------------------------------------------------
 @st.dialog("SCIIP AI Copilot", width="small")
-def _render_copilot_dialog(db_path: str | Path) -> None:
+def _render_copilot_dialog(db_path: str | Path, dashboard_context: dict[str, Any] | None = None) -> None:
     """Render floating drawer dialog synchronized with the persistent conversation store."""
     store = load_conversation_store(db_path)
     active_prov = load_active_provider_config(db_path)
@@ -796,7 +1003,11 @@ def _render_copilot_dialog(db_path: str | Path) -> None:
         with st.chat_message("assistant"):
             with st.spinner("Thinking…"):
                 answer, sources, provider = answer_question(
-                    question, db_path, current["messages"][:-1], provider_override=active_prov
+                    question,
+                    db_path,
+                    current["messages"][:-1],
+                    provider_override=active_prov,
+                    dashboard_context=dashboard_context,
                 )
             st.markdown(answer)
             if sources:
@@ -808,7 +1019,7 @@ def _render_copilot_dialog(db_path: str | Path) -> None:
         st.rerun()
 
 
-def render_copilot(db_path: str | Path) -> None:
+def render_copilot(db_path: str | Path, dashboard_context: dict[str, Any] | None = None) -> None:
     """Render the fixed launcher button; the chat itself opens as a dialog."""
     if "copilot_open" not in st.session_state:
         st.session_state.copilot_open = False
@@ -817,4 +1028,4 @@ def render_copilot(db_path: str | Path) -> None:
         if st.button("✦ AI Copilot", key="copilot_launcher", help="Open SCIIP AI Copilot"):
             st.session_state.copilot_open = not st.session_state.copilot_open
     if st.session_state.copilot_open:
-        _render_copilot_dialog(db_path)
+        _render_copilot_dialog(db_path, dashboard_context)
