@@ -1,0 +1,21 @@
+{
+  "part_master_columns": [
+    "source",
+    "source",
+    "source",
+    "source",
+    "current_stock",
+    "computed_available_qty",
+    "open_vendor_qty",
+    "lead_time_days",
+    "moq",
+    "vendor",
+    "standard_cost",
+    "part_status_raw",
+    "xfer_status",
+    "xfer_criticality",
+    "xfer_transfer_date",
+    "xfer_standard_cost",
+    "xfer_na_list_price"
+  ]
+}

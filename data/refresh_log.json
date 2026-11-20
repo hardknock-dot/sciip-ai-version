@@ -1,0 +1,26 @@
+[
+  {
+    "timestamp": "2026-11-04 15:35:54",
+    "status": "Success",
+    "source_file": "New_Skyline_sales_Register_freight_28062023_HANA.xlsx",
+    "duration_seconds": 172.0,
+    "detail": "2,846 demand lines, 515 parts, 93 customers | Item Master updated | Part transfer list updated",
+    "report": "C:\\Users\\Manav\\Downloads\\sciip\\outputs\\sciip_demand_lines_20261104_153435.xlsx"
+  },
+  {
+    "timestamp": "2026-11-03 15:31:59",
+    "status": "Success",
+    "source_file": "New_Skyline_sales_Register_freight_28062023_HANA.xlsx",
+    "duration_seconds": 118.2,
+    "detail": "2,846 demand lines, 515 parts, 93 customers | Item Master reused",
+    "report": "C:\\Users\\Manav\\Downloads\\sciip\\outputs\\sciip_demand_lines_20261103_153123.xlsx"
+  },
+  {
+    "timestamp": "2026-10-26 19:00:10",
+    "status": "Success",
+    "source_file": "sales_register.xlsx",
+    "duration_seconds": 108.0,
+    "detail": "2,642 demand lines, 488 parts, 91 customers | Item Master reused",
+    "report": "C:\\Users\\Manav\\Downloads\\sciip\\outputs\\sciip_demand_lines_20261026_185931.xlsx"
+  }
+]

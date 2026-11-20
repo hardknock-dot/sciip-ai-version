@@ -1,0 +1,10 @@
+.env
+__pycache__/
+.pytest_cache/
+data/copilot_config.json
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+data/copilot_config.json
