@@ -1772,7 +1772,7 @@ with tab_item:
 # TAB 8: AI COPILOT INTELLIGENCE MODULE
 # ===========================================================================
 with tab_copilot:
-    copilot.render_copilot_tab(DB_PATH)
+    copilot.render_copilot_tab(DB_PATH, project_filter=project_filter)
 
 # ===========================================================================
 # TAB 9: DATA REFRESH & INGESTION
