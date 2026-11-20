@@ -67,8 +67,8 @@ PROVIDER_PRESETS = {
     "Google Gemini": {
         "id": "gemini",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "models": ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash", "gemini-3.8-flash"],
-        "default_model": "gemini-2.5-flash",
+        "models": ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro-preview"],
+        "default_model": "gemini-3.8-flash",
         "env_var": "SCIIP_AI_API_KEY_1",
     },
     "OpenAI": {
@@ -143,33 +143,37 @@ def _get_config_path(db_path: str | Path) -> Path:
 
 
 def load_active_provider_config(db_path: str | Path) -> ProviderConfig:
-    """Load active provider config from copilot_config.json or fall back to .env."""
+    """Load saved provider/model settings but prefer non-empty environment credentials."""
+    env_name = _env("SCIIP_AI_PROVIDER_1") or "gemini"
+    display_name = next(
+        (name for name, preset in PROVIDER_PRESETS.items() if preset["id"] == env_name.lower()),
+        "Google Gemini",
+    )
+    env_preset = PROVIDER_PRESETS.get(display_name, PROVIDER_PRESETS["Google Gemini"])
+    env_key = (
+        _env("SCIIP_AI_API_KEY_1")
+        or _env(env_preset.get("env_var", ""))
+        or _env("GEMINI_API_KEY")
+        or _env("GOOGLE_API_KEY")
+    )
+
     cfg_file = _get_config_path(db_path)
+    saved: dict[str, Any] = {}
     if cfg_file.exists():
         try:
-            data = json.loads(cfg_file.read_text(encoding="utf-8"))
-            if data and isinstance(data, dict):
-                return ProviderConfig(
-                    name=data.get("name", "Google Gemini"),
-                    api_key=data.get("api_key", ""),
-                    model=data.get("model", "gemini-2.5-flash"),
-                    base_url=data.get("base_url") or None,
-                )
+            parsed = json.loads(cfg_file.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                saved = parsed
         except Exception as e:
             logger.warning("Error reading copilot_config.json: %s", e)
 
-    # Fallback to .env defaults
-    env_name = _env("SCIIP_AI_PROVIDER_1") or "gemini"
-    display_name = "Google Gemini"
-    for k, v in PROVIDER_PRESETS.items():
-        if v["id"] == env_name.lower():
-            display_name = k
-            break
-    preset = PROVIDER_PRESETS.get(display_name, PROVIDER_PRESETS["Google Gemini"])
-    key = _env("SCIIP_AI_API_KEY_1") or _env("OPENAI_API_KEY") or ""
-    model = _env("SCIIP_AI_MODEL_1") or preset["default_model"]
-    base_url = _env("SCIIP_AI_BASE_URL_1") or preset["base_url"] or None
-    return ProviderConfig(name=display_name, api_key=key, model=model, base_url=base_url)
+    saved_name = saved.get("name", display_name)
+    preset = PROVIDER_PRESETS.get(saved_name, env_preset)
+    saved_env_key = _env(preset.get("env_var", "")) if preset.get("env_var") else ""
+    key = env_key or saved_env_key or str(saved.get("api_key") or "")
+    model = str(saved.get("model") or _env("SCIIP_AI_MODEL_1") or preset["default_model"])
+    base_url = saved.get("base_url") or _env("SCIIP_AI_BASE_URL_1") or preset.get("base_url") or None
+    return ProviderConfig(name=saved_name, api_key=key, model=model, base_url=base_url)
 
 
 def save_active_provider_config(db_path: str | Path, config: ProviderConfig) -> bool:
@@ -188,7 +192,7 @@ def configured_fallback_providers() -> list[ProviderConfig]:
     """Return fallback providers from environment variables."""
     providers: list[ProviderConfig] = []
     defaults = {
-        "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-2.5-flash"),
+        "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-3.8-flash"),
         "openai": ("https://api.openai.com/v1", "gpt-4o-mini"),
         "groq": ("https://api.groq.com/openai/v1", "llama-3.1-8b-instant"),
         "openrouter": ("https://openrouter.ai/api/v1", "openai/gpt-4o-mini"),
@@ -352,8 +356,8 @@ def _score_row(row: pd.Series, question_tokens: set[str], entity_values: dict[st
     return score
 
 
-def retrieve_context(question: str, db_path: str | Path) -> tuple[str, list[str]]:
-    """Retrieve evidence from the live SQLite database."""
+def retrieve_context(question: str, db_path: str | Path, project_filter: str | None = None) -> tuple[str, list[str]]:
+    """Retrieve bounded evidence from SQLite and respect the active project scope."""
     conn = sqlite3.connect(db_path)
     try:
         q_tokens = _tokens(question)
@@ -377,6 +381,13 @@ def retrieve_context(question: str, db_path: str | Path) -> tuple[str, list[str]
             if df.empty:
                 continue
             df = df.copy()
+            # Avoid leaking cross-project aggregate rows into a project-scoped answer.
+            if project_filter and project_filter != "All":
+                if "project" not in df.columns:
+                    continue
+                df = df[df["project"].astype(str).str.casefold() == str(project_filter).casefold()]
+                if df.empty:
+                    continue
             df["_retrieval_score"] = df.apply(lambda row: _score_row(row, q_tokens, entities), axis=1)
             preferred = [c for c in ("severity", "supply_risk", "status", "recency_days", "cv2", "forecast_next_6mo_qty") if c in df]
             if preferred:
@@ -411,23 +422,28 @@ def answer_question(
     question: str,
     db_path: str | Path,
     history: list[dict[str, Any]] | None = None,
-    provider_override: ProviderConfig | None = None
+    provider_override: ProviderConfig | None = None,
+    project_filter: str | None = None
 ) -> tuple[str, list[str], str | None]:
-    """Synthesize grounded answer using the selected provider or fallback order."""
-    context, sources = retrieve_context(question, db_path)
+    """Synthesize a grounded answer using the selected provider or fallback order."""
+    context, sources = retrieve_context(question, db_path, project_filter=project_filter)
 
     # Check if user explicitly set Offline mode
     active = provider_override or load_active_provider_config(db_path)
     if active.name.lower().startswith("offline") or active.api_key == "offline":
         return _local_grounded_answer(question, context, sources), sources, "Offline Database"
 
+    scope_label = project_filter if project_filter and project_filter != "All" else "All projects"
     system = (
-        "You are SCIIP AI Copilot, a senior semiconductor supply chain and inventory operations analyst. "
-        "Answer questions accurately using only the supplied SCIIP database context. "
-        "Explain inventory positions, demand volatility (Smooth, Erratic, Intermittent, Lumpy), "
-        "customer ordering cadence, forecast projections, and replenishment priorities clearly. "
-        "Never hallucinate numbers. Cite supporting evidence inline like [table:column/value]. "
-        "If data is missing, note it plainly.\n\n"
+        "You are SCIIP Copilot, a senior semiconductor supply-chain and inventory analyst. "
+        "Answer the user's specific question rather than merely summarizing retrieved records. "
+        "Use only the supplied SCIIP database evidence for factual claims. Never invent quantities, "
+        "dates, customers, part numbers, stock levels, forecasts, calculations, or data sources. "
+        "If the evidence does not answer the question, say so and explain what is missing. "
+        "Do not equate a row's presence with risk. Explain the metric used for rankings and comparisons. "
+        "Separate verified facts from interpretations and recommendations. Avoid raw JSON dumps. "
+        "Use concise executive-style sections, bullets, or tables when helpful. Cite evidence as [table.column]. "
+        "Active dashboard scope: " + scope_label + ". Do not use evidence from outside this scope.\n\n"
         f"GROUNDED DATABASE CONTEXT:\n{context}"
     )
 
@@ -442,7 +458,7 @@ def answer_question(
     if active.api_key:
         providers_queue.append(active)
     for p in configured_fallback_providers():
-        if p.name.lower() != active.name.lower():
+        if not (p.name.lower() == active.name.lower() and p.model == active.model and p.base_url == active.base_url):
             providers_queue.append(p)
 
     if not providers_queue:
@@ -480,7 +496,7 @@ def answer_question(
 # ---------------------------------------------------------------------------
 # Dedicated Full-Page AI Copilot Module Tab
 # ---------------------------------------------------------------------------
-def render_copilot_tab(db_path: str | Path) -> None:
+def render_copilot_tab(db_path: str | Path, project_filter: str | None = None) -> None:
     """Full-page interactive AI Copilot tab with persistent chat history and provider settings."""
     active_prov = load_active_provider_config(db_path)
     store = load_conversation_store(db_path)
@@ -700,7 +716,8 @@ def render_copilot_tab(db_path: str | Path) -> None:
                             user_query,
                             db_path,
                             current_session["messages"][:-1],
-                            provider_override=active_prov
+                            provider_override=active_prov,
+                            project_filter=project_filter
                         )
                     st.markdown(ans_text)
                     if sources:
